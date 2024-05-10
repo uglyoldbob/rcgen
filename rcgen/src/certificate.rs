@@ -16,7 +16,7 @@ use crate::ring_like::digest;
 #[cfg(feature = "pem")]
 use crate::ENCODE_CONFIG;
 use crate::{
-	oid, write_distinguished_name, write_dt_utc_or_generalized,
+	oid, write_distinguished_name, write_dt_utc_or_generalized, write_x509_attribute,
 	write_x509_authority_key_identifier, write_x509_extension, DistinguishedName, Error,
 	KeyIdMethod, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
@@ -74,6 +74,8 @@ pub struct CertificateParams {
 	pub key_usages: Vec<KeyUsagePurpose>,
 	pub extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
 	pub name_constraints: Option<NameConstraints>,
+	/// Extra attributes that appear in a certificate signing request, such as oid 1.2.840.113549.1.9.7 (challenge password)
+	pub extra_attributes: Vec<CustomAttribute>,
 	/// An optional list of certificate revocation list (CRL) distribution points as described
 	/// in RFC 5280 Section 4.2.1.13[^1]. Each distribution point contains one or more URIs where
 	/// an up-to-date CRL with scope including this certificate can be retrieved.
@@ -106,6 +108,7 @@ impl Default for CertificateParams {
 			key_usages: Vec::new(),
 			extended_key_usages: Vec::new(),
 			name_constraints: None,
+			extra_attributes: Vec::new(),
 			crl_distribution_points: Vec::new(),
 			custom_extensions: Vec::new(),
 			use_authority_key_identifier_extension: false,
@@ -514,6 +517,7 @@ impl CertificateParams {
 			key_usages,
 			extended_key_usages,
 			name_constraints,
+			extra_attributes,
 			crl_distribution_points,
 			custom_extensions,
 			use_authority_key_identifier_extension,
@@ -525,12 +529,7 @@ impl CertificateParams {
 		// in the CSR, but in the current API it can't be distinguished
 		// from the defaults so this is left for a later version if
 		// needed.
-		let _ = (
-			not_before,
-			not_after,
-			key_identifier_method,
-			extended_key_usages,
-		);
+		let _ = (not_before, not_after, key_identifier_method);
 		if serial_number.is_some()
 			|| *is_ca != IsCa::NoCa
 			|| !key_usages.is_empty()
@@ -541,6 +540,42 @@ impl CertificateParams {
 			return Err(Error::UnsupportedInCsr);
 		}
 
+		let extensions_der = yasna::construct_der_seq(|writer| {
+			for attr in extra_attributes {
+				write_x509_attribute(writer.next(), &attr.oid, |writer| {
+					writer.write_der(attr.content())
+				});
+			}
+			if !subject_alt_names.is_empty()
+				|| !custom_extensions.is_empty()
+				|| !extended_key_usages.is_empty()
+			{
+				writer.next().write_sequence(|writer| {
+					let oid = ObjectIdentifier::from_slice(oid::PKCS_9_AT_EXTENSION_REQUEST);
+					writer.next().write_oid(&oid);
+					writer.next().write_set(|writer| {
+						writer.next().write_sequence(|writer| {
+							// Write subject_alt_names
+							if !subject_alt_names.is_empty() {
+								self.write_subject_alt_names(writer.next());
+							}
+							self.write_extended_key_usage(writer.next());
+
+							// Write custom extensions
+							for ext in custom_extensions {
+								write_x509_extension(
+									writer.next(),
+									&ext.oid,
+									ext.critical,
+									|writer| writer.write_der(ext.content()),
+								);
+							}
+						});
+					});
+				});
+			}
+		});
+
 		let der = subject_key.sign_der(|writer| {
 			// Write version
 			writer.next().write_u8(0);
@@ -550,31 +585,9 @@ impl CertificateParams {
 			subject_key.serialize_public_key_der(writer.next());
 			// Write extensions
 			// According to the spec in RFC 2986, even if attributes are empty we need the empty attribute tag
-			writer.next().write_tagged(Tag::context(0), |writer| {
-				if !subject_alt_names.is_empty() || !custom_extensions.is_empty() {
-					writer.write_sequence(|writer| {
-						let oid = ObjectIdentifier::from_slice(oid::PKCS_9_AT_EXTENSION_REQUEST);
-						writer.next().write_oid(&oid);
-						writer.next().write_set(|writer| {
-							writer.next().write_sequence(|writer| {
-								// Write subject_alt_names
-								self.write_subject_alt_names(writer.next());
-								self.write_extended_key_usage(writer.next());
-
-								// Write custom extensions
-								for ext in custom_extensions {
-									write_x509_extension(
-										writer.next(),
-										&ext.oid,
-										ext.critical,
-										|writer| writer.write_der(ext.content()),
-									);
-								}
-							});
-						});
-					});
-				}
-			});
+			writer
+				.next()
+				.write_tagged(Tag::context(0), |writer| writer.write_der(&extensions_der));
 
 			Ok(())
 		})?;
@@ -891,6 +904,32 @@ impl CustomExtension {
 	/// Obtains the criticality flag of the extension.
 	pub fn criticality(&self) -> bool {
 		self.critical
+	}
+	/// Obtains the content of the extension.
+	pub fn content(&self) -> &[u8] {
+		&self.content
+	}
+	/// Obtains the OID components of the extensions, as u64 pieces
+	pub fn oid_components(&self) -> impl Iterator<Item = u64> + '_ {
+		self.oid.iter().copied()
+	}
+}
+
+/// A custom attribute of a certificate
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct CustomAttribute {
+	oid: Vec<u64>,
+	/// The content must be DER-encoded
+	content: Vec<u8>,
+}
+
+impl CustomAttribute {
+	/// Create a new custom extension with the specified content
+	pub fn from_oid_content(oid: &[u64], content: Vec<u8>) -> Self {
+		Self {
+			oid: oid.to_owned(),
+			content,
+		}
 	}
 	/// Obtains the content of the extension.
 	pub fn content(&self) -> &[u8] {

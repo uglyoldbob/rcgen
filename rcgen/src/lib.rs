@@ -49,8 +49,8 @@ use yasna::DERWriter;
 use yasna::Tag;
 
 pub use certificate::{
-	date_time_ymd, BasicConstraints, Certificate, CertificateParams, CidrSubnet, CustomExtension,
-	DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, NameConstraints,
+	date_time_ymd, BasicConstraints, Certificate, CertificateParams, CidrSubnet, CustomAttribute,
+	CustomExtension, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, NameConstraints,
 };
 pub use crl::{
 	CertificateRevocationList, CertificateRevocationListParams, CrlDistributionPoint,
@@ -554,6 +554,29 @@ fn write_distinguished_name(writer: DERWriter, dn: &DistinguishedName) {
 			});
 		}
 	});
+}
+
+/// Serializes an attribute according to RFC 2985
+fn write_x509_attribute(
+	writer: DERWriter,
+	extension_oid: &[u64],
+	value_serializer: impl FnOnce(DERWriter),
+) {
+	// Attribute specification:
+	//    Attribute  ::=  SEQUENCE  {
+	//         extnID      OBJECT IDENTIFIER,
+	//         extnValue   OCTET STRING
+	//                     -- contains the DER encoding of an ASN.1 value
+	//                     -- corresponding to the extension type identified
+	//                     -- by extnID
+	//         }
+
+	writer.write_sequence(|writer| {
+		let oid = ObjectIdentifier::from_slice(extension_oid);
+		writer.next().write_oid(&oid);
+		let bytes = yasna::construct_der(value_serializer);
+		writer.next().write_der(&bytes);
+	})
 }
 
 /// Serializes an X.509v3 extension according to RFC 5280
